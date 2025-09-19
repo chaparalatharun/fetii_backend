@@ -2080,6 +2080,34 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
         }
     )
 
+@app.get("/debug/test-openai")
+async def test_openai():
+    """Test OpenAI API connectivity"""
+    try:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            return {"error": "OpenAI API key not configured", "success": False}
+
+        # Test simple OpenAI API call
+        response = await analyst.openai_client.chat.completions.create(
+            model="gpt-4o-mini-2024-07-18",
+            messages=[{"role": "user", "content": "Say 'OpenAI connection test successful'"}],
+            max_completion_tokens=50
+        )
+
+        return {
+            "success": True,
+            "api_key_present": True,
+            "api_key_prefix": api_key[:8] + "..." if api_key else None,
+            "response": response.choices[0].message.content
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "api_key_present": bool(os.getenv('OPENAI_API_KEY'))
+        }
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
