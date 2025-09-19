@@ -607,7 +607,7 @@ Write natural-language responses that are conversational, professional, and prov
         try:
             # Stream from OpenAI
             stream = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
+                model="gpt-5",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Question: {question}\n\nAnalyze this question about our rideshare data and provide insights. Think through the data patterns step by step."}
@@ -713,7 +713,7 @@ Rules:
         try:
             # Stream from OpenAI with thinking process
             stream = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
+                model="gpt-5",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Question: {question}\n\nThink through how to query the data step by step, then provide the SQL query or JSON plan."}
@@ -883,7 +883,7 @@ Rules:
 
         try:
             response = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
+                model="gpt-5",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -1099,7 +1099,7 @@ Rules:
         # Optional: low-cost LLM hint (short prompt, temp=0)
         try:
             hint = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
+                model="gpt-5",
                 # GPT-5 only supports default temperature (1)
                 max_completion_tokens=3,
                 messages=[
@@ -1416,7 +1416,7 @@ Write a natural-language analyst answer:
 
         try:
             response = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
+                model="gpt-5",
                 messages=[
                     {"role": "system", "content": system_prompt_analyst},
                     {"role": "user", "content": user_prompt}
@@ -2090,7 +2090,7 @@ async def test_openai():
 
         # Test simple OpenAI API call
         response = await analyst.openai_client.chat.completions.create(
-            model="gpt-4o-mini-2024-07-18",
+            model="gpt-5",
             messages=[{"role": "user", "content": "Say 'OpenAI connection test successful'"}],
             max_completion_tokens=50
         )
