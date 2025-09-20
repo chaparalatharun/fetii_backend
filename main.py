@@ -787,10 +787,25 @@ Rules:
         return text
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    async def _generate_sql(self, question: str) -> str:
-        """Generate SQL query or JSON plan using OpenAI."""
+    async def _generate_sql_with_retry(self, question: str, attempt: int = 1, previous_error: str = None) -> str:
+        """Generate SQL query or JSON plan using OpenAI with retry logic for failed queries."""
+        max_attempts = 3
+
+        # Add context about previous failures for retry attempts
+        error_context = ""
+        if previous_error and attempt > 1:
+            error_context = f"""
+IMPORTANT: Previous attempt failed with error: {previous_error}
+Please try a different approach that avoids this error. Consider:
+- Using different table joins
+- Simplifying the query structure
+- Using fallback approaches if specific data isn't available
+- Using broader filters or different column names
+"""
 
         system_prompt = f"""You are a SQL expert for Austin rideshare data analysis.
+
+{error_context}
 
 Temperature 0.0. Return JSON multi-step when the question has multiple sub-goals (e.g., filter, join, rank, and compute share). Otherwise return a single SELECT.
 
@@ -908,6 +923,10 @@ Rules:
         except Exception as e:
             print(f"Error generating SQL: {e}")
             return ""
+
+    async def _generate_sql(self, question: str) -> str:
+        """Legacy wrapper for _generate_sql_with_retry for backward compatibility."""
+        return await self._generate_sql_with_retry(question)
 
     def _parse_plan_or_sql(self, text: str) -> Dict[str, Any]:
         """Parse response as JSON plan or single SQL."""
@@ -1072,6 +1091,123 @@ Rules:
                 "data": [],
                 "error": str(e)
             }
+
+    async def execute_query_with_retry(self, question: str, max_attempts: int = 3) -> Dict[str, Any]:
+        """Execute query with agentic retry logic for failed SQL queries."""
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            print(f"🔄 Attempt {attempt}/{max_attempts} for question: {question}")
+
+            try:
+                # Generate SQL with context of previous failures
+                sql_or_plan = await self._generate_sql_with_retry(question, attempt, last_error)
+
+                if not sql_or_plan:
+                    last_error = "Failed to generate SQL query"
+                    continue
+
+                # Parse the SQL/plan
+                parsed = self._parse_plan_or_sql(sql_or_plan)
+
+                # Execute based on type
+                if parsed["type"] == "plan":
+                    # Execute multi-step plan
+                    all_results = []
+                    completed_step_ids = set()
+
+                    for step in parsed["plan"]["steps"]:
+                        sql = step["sql"].strip()
+                        step_id = step.get("id")
+                        safe_view_name = self._sanitize_step_id(step_id) if step_id else None
+
+                        # Validate SQL
+                        is_valid, error_msg = self._validate_sql_safety(sql, valid_step_ids=completed_step_ids)
+                        if not is_valid:
+                            raise Exception(f"Invalid SQL in step {step_id}: {error_msg}")
+
+                        sql = self._maybe_inject_limit(sql)
+                        res = self.execute_query(sql)
+
+                        if res.get("error"):
+                            raise Exception(f"SQL execution error in step {step_id}: {res['error']}")
+
+                        all_results.append({
+                            "id": step_id,
+                            "purpose": step.get("purpose"),
+                            "columns": res.get("columns", []),
+                            "row_count": res.get("row_count", 0),
+                            "data": res.get("data", []),
+                            "error": None
+                        })
+
+                        # Create temporary view for chaining
+                        if safe_view_name and res.get("data"):
+                            try:
+                                df = pd.DataFrame(res["data"])
+                                if not df.empty:
+                                    self.conn.register(safe_view_name, df)
+                                    completed_step_ids.add(safe_view_name.upper())
+                            except Exception as e:
+                                print(f"Warning: Could not create temporary view for step {step_id}: {e}")
+
+                    # Return success with all results
+                    return {
+                        "success": True,
+                        "results": all_results,
+                        "sql_used": [step["sql"] for step in parsed["plan"]["steps"]],
+                        "attempt": attempt
+                    }
+
+                else:
+                    # Execute single SQL
+                    sql = parsed["sql"]
+                    is_valid, error_msg = self._validate_sql_safety(sql)
+                    if not is_valid:
+                        raise Exception(f"Invalid SQL: {error_msg}")
+
+                    sql = self._maybe_inject_limit(sql)
+                    res = self.execute_query(sql)
+
+                    if res.get("error"):
+                        raise Exception(f"SQL execution error: {res['error']}")
+
+                    # Return success
+                    return {
+                        "success": True,
+                        "results": [{
+                            "id": "single",
+                            "purpose": "single_query",
+                            "columns": res.get("columns", []),
+                            "row_count": res.get("row_count", 0),
+                            "data": res.get("data", []),
+                            "error": None
+                        }],
+                        "sql_used": [sql],
+                        "attempt": attempt
+                    }
+
+            except Exception as e:
+                print(f"❌ Attempt {attempt} failed: {str(e)}")
+                last_error = str(e)
+
+                if attempt == max_attempts:
+                    # Final attempt failed, return error
+                    return {
+                        "success": False,
+                        "error": f"Failed after {max_attempts} attempts. Last error: {last_error}",
+                        "attempt": attempt
+                    }
+
+                # Continue to next attempt
+                continue
+
+        # Should not reach here, but safety fallback
+        return {
+            "success": False,
+            "error": f"Failed after {max_attempts} attempts. Last error: {last_error}",
+            "attempt": max_attempts
+        }
 
     async def should_visualize(self, question: str, result: Dict[str, Any]) -> bool:
         """Determine if a visualization would be helpful for this question and result."""
@@ -1937,76 +2073,22 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
             yield f"event: thinking_end\ndata: {json.dumps({'section': 'thinking_complete'})}\n\n"
             await asyncio.sleep(0)
 
-            # Phase 2: Execute the captured SQL and stream the analysis
+            # Phase 2: Execute query with agentic retry logic
             yield f"event: analysis_start\ndata: {json.dumps({'section': 'analysis'})}\n\n"
             await asyncio.sleep(0)
 
-            # Parse the generated SQL/plan and execute it directly (skip redundant LLM calls)
-            if generated_sql_or_plan.strip():
-                # Extract SQL/JSON from the thinking output
-                sql_or_plan = analyst._extract_sql_from_thinking(generated_sql_or_plan)
+            # Use the new agentic retry logic
+            retry_result = await analyst.execute_query_with_retry(q, max_attempts=3)
 
-                # Parse and execute the SQL/plan
-                parsed = analyst._parse_plan_or_sql(sql_or_plan)
+            if retry_result["success"]:
+                all_results = retry_result["results"]
+                sql_used_concat = retry_result["sql_used"]
+                attempt_num = retry_result["attempt"]
 
-                all_results = []
-                sql_used_concat = []
-
-                if parsed["type"] == "plan":
-                    # Execute multi-step plan
-                    completed_step_ids = set()
-
-                    for step in parsed["plan"]["steps"]:
-                        sql = step["sql"].strip()
-                        step_id = step.get("id")
-                        safe_view_name = analyst._sanitize_step_id(step_id) if step_id else None
-
-                        # Validate and execute SQL
-                        is_valid, error_msg = analyst._validate_sql_safety(sql, valid_step_ids=completed_step_ids)
-                        if not is_valid:
-                            yield f"event: error\ndata: {json.dumps({'error': f'Invalid query: {error_msg}'})}\n\n"
-                            return
-
-                        sql = analyst._maybe_inject_limit(sql)
-                        res = analyst.execute_query(sql)
-                        sql_used_concat.append(sql)
-                        all_results.append({
-                            "id": step_id,
-                            "purpose": step.get("purpose"),
-                            "columns": res.get("columns", []),
-                            "row_count": res.get("row_count", 0),
-                            "data": res.get("data", []),
-                            "error": res.get("error")
-                        })
-
-                        # Create temporary view for chaining
-                        if safe_view_name and res.get("data") and not res.get("error"):
-                            try:
-                                df = pd.DataFrame(res["data"])
-                                if not df.empty:
-                                    analyst.conn.register(safe_view_name, df)
-                                    completed_step_ids.add(safe_view_name.upper())
-                            except Exception as e:
-                                print(f"Warning: Could not create temporary view for step {step_id}: {e}")
-                else:
-                    # Execute single SQL
-                    sql = parsed["sql"]
-                    is_valid, error_msg = analyst._validate_sql_safety(sql)
-                    if not is_valid:
-                        yield f"event: error\ndata: {json.dumps({'error': f'Invalid query: {error_msg}'})}\n\n"
-                        return
-
-                    sql = analyst._maybe_inject_limit(sql)
-                    res = analyst.execute_query(sql)
-                    sql_used_concat.append(sql)
-                    all_results.append({
-                        "id": "single",
-                        "purpose": "single_query",
-                        "columns": res.get("columns", []),
-                        "row_count": res.get("row_count", 0),
-                        "data": res.get("data", []),
-                        "error": res.get("error")
-                    })
+                # Stream information about retry attempts if any were needed
+                if attempt_num > 1:
+                    yield f"event: analysis\ndata: {json.dumps({'delta': f'Found the right approach after {attempt_num} attempts. '})}\n\n"
+                    await asyncio.sleep(0)
 
                 # Generate the natural language response using the results
                 nl_answer = await analyst._generate_response(
@@ -2061,7 +2143,25 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
                         "sql_query": all_results[0].get("sql") if all_results else None
                     })
             else:
-                yield f"event: error\ndata: {json.dumps({'error': 'No SQL generated from thinking process'})}\n\n"
+                # Handle retry failure gracefully - don't break the stream!
+                error_msg = retry_result["error"]
+                yield f"event: analysis\ndata: {json.dumps({'delta': f'I encountered some challenges analyzing this data. {error_msg} Let me provide what I can understand from the question. '})}\n\n"
+                await asyncio.sleep(0)
+
+                # Generate a fallback response using just the question context
+                fallback_response = f"I wasn't able to execute the specific query for '{q}', but I can help you explore this data in other ways. Could you try rephrasing the question or asking about a related aspect of the data?"
+
+                # Stream the fallback response
+                for char in fallback_response:
+                    yield f"event: analysis\ndata: {json.dumps({'delta': char})}\n\n"
+                    await asyncio.sleep(0.03)
+
+                # Save fallback response to session
+                append_message(sid, chat_id, "assistant", fallback_response, {
+                    "blocks": [],
+                    "sql_query": None,
+                    "error": error_msg
+                })
 
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
