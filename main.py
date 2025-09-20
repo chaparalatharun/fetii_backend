@@ -1096,31 +1096,39 @@ Rules:
         """Check if the question is actually about data analysis or just a greeting/chat."""
         question_lower = question.lower().strip()
 
-        # Greetings and non-data questions
-        non_data_patterns = [
-            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
-            'how are you', 'what\'s up', 'thanks', 'thank you', 'bye', 'goodbye',
-            'who are you', 'what can you do', 'help', 'what is this', 'test'
-        ]
-
-        # If the question is just a greeting or non-data question
-        if any(pattern in question_lower for pattern in non_data_patterns):
-            return False
-
-        # Data-related keywords
+        # Data-related keywords - check these FIRST
         data_keywords = [
             'trip', 'user', 'ride', 'passenger', 'location', 'address', 'data',
             'count', 'how many', 'show me', 'find', 'search', 'filter',
             'average', 'total', 'sum', 'max', 'min', 'most', 'least',
-            'when', 'where', 'who', 'what time', 'demographics', 'age'
+            'when', 'where', 'who', 'what time', 'demographics', 'age',
+            'user id', 'trip id', 'highest', 'lowest', 'number of'
         ]
 
-        # If it contains data keywords, treat as data question
+        # If it contains data keywords, treat as data question (priority check)
         if any(keyword in question_lower for keyword in data_keywords):
             return True
 
-        # If it's a short question without data keywords, likely not data-related
-        if len(question.split()) <= 3:
+        # Simple greetings that are clearly not data questions
+        simple_greetings = [
+            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'how are you', 'what\'s up', 'thanks', 'thank you', 'bye', 'goodbye'
+        ]
+
+        # Check if it's EXACTLY a simple greeting (not just contains it)
+        if question_lower in simple_greetings:
+            return False
+
+        # Meta questions about the system
+        meta_questions = [
+            'who are you', 'what can you do', 'help', 'what is this', 'test'
+        ]
+
+        if any(pattern in question_lower for pattern in meta_questions):
+            return False
+
+        # If it's a very short question without data keywords, likely not data-related
+        if len(question.split()) <= 2:
             return False
 
         return True  # Default to treating as data question if unsure
