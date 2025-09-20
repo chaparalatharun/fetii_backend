@@ -1092,8 +1092,53 @@ Rules:
                 "error": str(e)
             }
 
+    def _is_data_related_question(self, question: str) -> bool:
+        """Check if the question is actually about data analysis or just a greeting/chat."""
+        question_lower = question.lower().strip()
+
+        # Greetings and non-data questions
+        non_data_patterns = [
+            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'how are you', 'what\'s up', 'thanks', 'thank you', 'bye', 'goodbye',
+            'who are you', 'what can you do', 'help', 'what is this', 'test'
+        ]
+
+        # If the question is just a greeting or non-data question
+        if any(pattern in question_lower for pattern in non_data_patterns):
+            return False
+
+        # Data-related keywords
+        data_keywords = [
+            'trip', 'user', 'ride', 'passenger', 'location', 'address', 'data',
+            'count', 'how many', 'show me', 'find', 'search', 'filter',
+            'average', 'total', 'sum', 'max', 'min', 'most', 'least',
+            'when', 'where', 'who', 'what time', 'demographics', 'age'
+        ]
+
+        # If it contains data keywords, treat as data question
+        if any(keyword in question_lower for keyword in data_keywords):
+            return True
+
+        # If it's a short question without data keywords, likely not data-related
+        if len(question.split()) <= 3:
+            return False
+
+        return True  # Default to treating as data question if unsure
+
     async def execute_query_with_retry(self, question: str, max_attempts: int = 3) -> Dict[str, Any]:
         """Execute query with agentic retry logic for failed SQL queries."""
+
+        # First check if this is actually a data-related question
+        if not self._is_data_related_question(question):
+            # Return a conversational response instead of trying SQL
+            return {
+                "success": True,
+                "is_conversational": True,
+                "results": [],
+                "sql_used": [],
+                "attempt": 1
+            }
+
         last_error = None
 
         for attempt in range(1, max_attempts + 1):
@@ -2050,7 +2095,38 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
         await asyncio.sleep(0)
 
         try:
-            # Phase 1: Stream the SQL thinking process AND capture the generated SQL
+            # Quick check if this is a conversational question (greeting, etc.)
+            if not analyst._is_data_related_question(q):
+                # Skip SQL thinking for conversational responses
+                yield f"event: analysis_start\ndata: {json.dumps({'section': 'analysis'})}\n\n"
+                await asyncio.sleep(0)
+
+                # Generate friendly response directly
+                conversational_responses = {
+                    'hello': "Hello! I'm your Fetii Data Analyst. I can help you analyze Austin rideshare data with natural language queries. What would you like to explore?",
+                    'hi': "Hi there! I'm here to help you analyze rideshare data. Feel free to ask me about trips, users, locations, or any patterns you're curious about!",
+                    'hey': "Hey! Ready to dive into some data analysis? I can help you understand Austin rideshare patterns, user behavior, and much more.",
+                    'how are you': "I'm doing great, thanks for asking! I'm excited to help you explore the rideshare data. What insights are you looking for today?",
+                    'what can you do': "I can help you analyze Austin rideshare data! Ask me about trip patterns, user demographics, popular locations, peak hours, and much more. Just ask in natural language!",
+                    'help': "I'm your data analysis assistant! Try asking questions like: 'How many trips were there last month?', 'What are the busiest hours?', or 'Show me the top pickup locations'. I'll help you explore the data!"
+                }
+
+                q_lower = q.lower().strip()
+                nl_answer = conversational_responses.get(q_lower, "Hello! I'm your Fetii Data Analyst, ready to help you explore Austin rideshare data. What would you like to know?")
+
+                # Stream the conversational response
+                for char in nl_answer:
+                    yield f"event: analysis\ndata: {json.dumps({'delta': char})}\n\n"
+                    await asyncio.sleep(0.03)
+
+                # Save conversational response to session
+                append_message(sid, chat_id, "assistant", nl_answer, {"blocks": []})
+
+                # Send done event
+                yield "event: done\ndata: {}\n\n"
+                return
+
+            # Phase 1: Stream the SQL thinking process AND capture the generated SQL (for data questions only)
             yield f"event: thinking_start\ndata: {json.dumps({'section': 'thinking'})}\n\n"
             await asyncio.sleep(0)
 
@@ -2081,23 +2157,45 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
             retry_result = await analyst.execute_query_with_retry(q, max_attempts=3)
 
             if retry_result["success"]:
-                all_results = retry_result["results"]
-                sql_used_concat = retry_result["sql_used"]
-                attempt_num = retry_result["attempt"]
-
-                # Stream information about retry attempts if any were needed
-                if attempt_num > 1:
-                    yield f"event: analysis\ndata: {json.dumps({'delta': f'Found the right approach after {attempt_num} attempts. '})}\n\n"
-                    await asyncio.sleep(0)
-
-                # Generate the natural language response using the results
-                nl_answer = await analyst._generate_response(
-                    q,
-                    {
-                        "anchors": analyst._current_anchors(),
-                        "results": all_results
+                # Check if this is a conversational response (greeting, etc.)
+                if retry_result.get("is_conversational", False):
+                    # Generate a friendly conversational response
+                    conversational_responses = {
+                        'hello': "Hello! I'm your Fetii Data Analyst. I can help you analyze Austin rideshare data with natural language queries. What would you like to explore?",
+                        'hi': "Hi there! I'm here to help you analyze rideshare data. Feel free to ask me about trips, users, locations, or any patterns you're curious about!",
+                        'hey': "Hey! Ready to dive into some data analysis? I can help you understand Austin rideshare patterns, user behavior, and much more.",
+                        'how are you': "I'm doing great, thanks for asking! I'm excited to help you explore the rideshare data. What insights are you looking for today?",
+                        'what can you do': "I can help you analyze Austin rideshare data! Ask me about trip patterns, user demographics, popular locations, peak hours, and much more. Just ask in natural language!",
+                        'help': "I'm your data analysis assistant! Try asking questions like: 'How many trips were there last month?', 'What are the busiest hours?', or 'Show me the top pickup locations'. I'll help you explore the data!"
                     }
-                )
+
+                    # Find the best matching response
+                    q_lower = q.lower().strip()
+                    nl_answer = conversational_responses.get(q_lower)
+
+                    if not nl_answer:
+                        # Default conversational response
+                        nl_answer = "Hello! I'm your Fetii Data Analyst, ready to help you explore Austin rideshare data. What would you like to know?"
+
+                else:
+                    # Regular data analysis response
+                    all_results = retry_result["results"]
+                    sql_used_concat = retry_result["sql_used"]
+                    attempt_num = retry_result["attempt"]
+
+                    # Stream information about retry attempts if any were needed
+                    if attempt_num > 1:
+                        yield f"event: analysis\ndata: {json.dumps({'delta': f'Found the right approach after {attempt_num} attempts. '})}\n\n"
+                        await asyncio.sleep(0)
+
+                    # Generate the natural language response using the results
+                    nl_answer = await analyst._generate_response(
+                        q,
+                        {
+                            "anchors": analyst._current_anchors(),
+                            "results": all_results
+                        }
+                    )
 
                 # Stream the analysis result character by character
                 if nl_answer:
@@ -2110,7 +2208,8 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
                 # Build proper blocks for the frontend
                 blocks = []
                 try:
-                    if all_results and all_results[0].get("data"):
+                    # Only try to create charts for data analysis responses, not conversational ones
+                    if not retry_result.get("is_conversational", False) and all_results and all_results[0].get("data"):
                         df = pd.DataFrame(all_results[0]["data"])
                         chart_cfg = analyst.create_chart(df, q)
                         if chart_cfg:
@@ -2138,10 +2237,13 @@ async def stream_chat(q: str, request: Request, x_session_id: str = Header(None)
 
                 # Save complete response to session
                 if nl_answer:
-                    append_message(sid, chat_id, "assistant", nl_answer, {
-                        "blocks": blocks,
-                        "sql_query": all_results[0].get("sql") if all_results else None
-                    })
+                    metadata = {"blocks": blocks}
+
+                    # Add SQL query info only for data analysis responses
+                    if not retry_result.get("is_conversational", False) and all_results:
+                        metadata["sql_query"] = all_results[0].get("sql") if all_results else None
+
+                    append_message(sid, chat_id, "assistant", nl_answer, metadata)
             else:
                 # Handle retry failure gracefully - don't break the stream!
                 error_msg = retry_result["error"]
